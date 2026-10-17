@@ -1,0 +1,6 @@
+{
+  "name": "OpenFileRescue",
+  "description": "Open source data recovery and file rescue suite. Deep carve, preview, repair, and restore lost photos, videos, audio, and documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

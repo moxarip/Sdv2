@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">OpenFileRescue</string>
+    <string name="tagline">Open-Source File Recovery &amp; Repair Suite</string>
+    <string name="tab_scan">Rescue Scanner</string>
+    <string name="tab_repair">File Repair</string>
+    <string name="tab_analyzer">Storage Health</string>
+    <string name="tab_rescued">Salvaged Files</string>
+    <string name="quick_scan">Quick Scan</string>
+    <string name="deep_scan">Deep Carving Scan</string>
+    <string name="custom_folder_scan">Custom Folder (SAF)</string>
+    <string name="scan_now">Start Scanning</string>
+    <string name="stop_scan">Stop Scan</string>
+    <string name="repair_file">Repair Corrupted File</string>
+    <string name="rescue_selected">Rescue Selected</string>
+</resources>

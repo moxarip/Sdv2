@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenFileRescue</string>
+    <string name="tagline">أداة استعادة وإصلاح الملفات مفتوحة المصدر</string>
+    <string name="tab_scan">ماسح الاستعادة</string>
+    <string name="tab_repair">إصلاح الملفات</string>
+    <string name="tab_analyzer">صحة التخزين</string>
+    <string name="tab_rescued">الملفات المنقذة</string>
+    <string name="quick_scan">فحص سريع</string>
+    <string name="deep_scan">فحص عميق بالبصمة</string>
+    <string name="custom_folder_scan">مجلد مخصص (SAF)</string>
+    <string name="scan_now">بدء الفحص</string>
+    <string name="stop_scan">إيقاف الفحص</string>
+    <string name="repair_file">إصلاح ملف تالف</string>
+    <string name="rescue_selected">استعادة المحدد</string>
+</resources>

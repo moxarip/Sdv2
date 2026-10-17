@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Rescue Shield -->
+    <path
+        android:fillColor="#0E3A4B"
+        android:pathData="M54,24 L76,33 C76,57 54,78 54,78 C54,78 32,57 32,33 Z" />
+    <path
+        android:strokeColor="#06B6D4"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,24 L76,33 C76,57 54,78 54,78 C54,78 32,57 32,33 Z" />
+
+    <!-- File Document Silhouette inside Shield -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M44,38 L58,38 L64,44 L64,62 L44,62 Z" />
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M58,38 L64,44 L58,44 Z" />
+
+    <!-- Rescue Cross / Healing Symbol -->
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M52,48 h4 v3 h3 v4 h-3 v3 h-4 v-3 h-3 v-4 h3 Z" />
+</vector>
