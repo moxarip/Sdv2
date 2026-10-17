@@ -2,7 +2,6 @@ package com.example.ui.components
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -24,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
@@ -56,6 +56,7 @@ import com.example.engine.FileRescueManager
 import com.example.model.FileCategory
 import com.example.model.RescuedFile
 import com.example.ui.RescueUiState
+import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.EmeraldRescue
 import com.example.ui.theme.Slate400
@@ -68,6 +69,8 @@ import java.io.File
 fun SalvagedFilesView(
     uiState: RescueUiState,
     onRefresh: () -> Unit,
+    onExportAllToDownloads: () -> Unit = {},
+    onExportAllAsZip: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isAr = uiState.appLanguage == "ar"
@@ -115,7 +118,7 @@ fun SalvagedFilesView(
 
                     Column {
                         Text(
-                            text = if (isAr) "الملفات المستعادة بأمان" else "Safely Salvaged Files",
+                            text = if (isAr) "الملفات المستعادة والمصنفة بأمان" else "Safely Salvaged & Categorized Files",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                         )
                         Text(
@@ -136,8 +139,54 @@ fun SalvagedFilesView(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Manifest Export Button
+        // Export to Public Downloads & ZIP Archive Sharing Bar
         if (files.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onExportAllToDownloads,
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldRescue),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .testTag("export_all_downloads_button")
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = "Downloads", tint = Color.Black, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isAr) "حفظ بالتنزيلات" else "Save to Downloads",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                }
+
+                Button(
+                    onClick = onExportAllAsZip,
+                    enabled = !uiState.isExportingZip,
+                    colors = ButtonDefaults.buttonColors(containerColor = CyanAccent),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(42.dp)
+                        .testTag("export_all_zip_button")
+                ) {
+                    Icon(Icons.Default.FolderZip, contentDescription = "ZIP", tint = Color.Black, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isAr) "تصدير ومشاركة ZIP" else "Export & Share ZIP",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
             OutlinedButton(
                 onClick = {
                     val reportFile = FileRescueManager.generateRecoveryReport(context, files)
@@ -146,16 +195,16 @@ fun SalvagedFilesView(
                 shape = RoundedCornerShape(10.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(44.dp)
+                    .height(38.dp)
                     .testTag("export_manifest_button")
             ) {
-                Icon(Icons.Default.Description, contentDescription = "Export", tint = CyanAccent)
+                Icon(Icons.Default.Description, contentDescription = "Export", tint = CyanAccent, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = if (isAr) "تصدير بيان وتقرير الاستعادة (Manifest Report)" else "Export Recovery Manifest Report",
                     color = CyanAccent,
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.sp
+                    fontSize = 11.sp
                 )
             }
             Spacer(modifier = Modifier.height(10.dp))
@@ -179,9 +228,9 @@ fun SalvagedFilesView(
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
                         text = if (isAr)
-                            "لا توجد ملفات مستعادة حالياً\nابدأ فحص الذاكرة واختر الملفات لحفظها في مجلدك الآمن"
+                            "لا توجد ملفات مستعادة حالياً\nابدأ فحص الذاكرة أو الـ USB لحفظ الملفات في مجلداتك الفرعية الآمنة"
                         else
-                            "No salvaged files yet.\nRun a scan and rescue files to save them to safe storage.",
+                            "No salvaged files yet.\nRun a scan or USB carve to save files to categorized subfolders.",
                         style = MaterialTheme.typography.bodyMedium.copy(
                             color = Slate400,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -278,6 +327,15 @@ fun SalvagedFileItem(file: RescuedFile, isAr: Boolean) {
                             color = CyanAccent,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp
+                        )
+                    )
+                    Text(text = "•", style = MaterialTheme.typography.bodySmall.copy(color = Slate700))
+                    Text(
+                        text = "${file.category.folderName}/",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = AmberWarning,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
                         )
                     )
                 }

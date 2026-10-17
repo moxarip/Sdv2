@@ -431,7 +431,15 @@ fun MainRescueScreen(
                                 uiState = uiState,
                                 onRequestUsbPermission = { viewModel.requestUsbPermission(it) },
                                 onRequestShizukuPermission = { viewModel.requestShizukuPermission() },
-                                onStartRawUsbCarve = { device, mb -> viewModel.startRawUsbCarve(device, mb) },
+                                onStartRawUsbCarve = { device, mb, resume ->
+                                    viewModel.startRawUsbCarve(device, mb, resume)
+                                },
+                                onInspectUsbMbr = { device -> viewModel.inspectUsbMbr(device) },
+                                onRestoreUsbBootSector = { device, backupLba, targetLba ->
+                                    viewModel.restoreUsbBootSector(device, backupLba, targetLba)
+                                },
+                                onDismissMbrReport = { viewModel.dismissMbrReport() },
+                                onDumpRawUsbImage = { device -> viewModel.dumpRawUsbDiskImage(device) },
                                 onStartShizukuCarve = { path -> viewModel.startShizukuCarve(path) },
                                 onRefresh = { viewModel.refreshUsbAndShizuku() },
                                 onStopScan = { viewModel.stopScan() }
@@ -472,7 +480,9 @@ fun MainRescueScreen(
                         AppTab.SALVAGED -> {
                             SalvagedFilesView(
                                 uiState = uiState,
-                                onRefresh = { viewModel.loadExistingSalvagedFiles() }
+                                onRefresh = { viewModel.loadExistingSalvagedFiles() },
+                                onExportAllToDownloads = { viewModel.exportAllSalvagedToDownloads() },
+                                onExportAllAsZip = { viewModel.exportAndShareAllSalvagedAsZip() }
                             )
                         }
                     }

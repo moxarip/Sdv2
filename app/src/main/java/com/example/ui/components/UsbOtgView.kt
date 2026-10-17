@@ -19,11 +19,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SdCard
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
@@ -51,8 +55,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.DetectedStorageVolume
+import com.example.engine.FileRescueManager
 import com.example.engine.ShizukuStatus
 import com.example.engine.UsbDeviceInfo
+import com.example.model.MbrBootSectorReport
 import com.example.ui.RescueUiState
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CyanAccent
@@ -68,7 +74,11 @@ fun UsbOtgView(
     uiState: RescueUiState,
     onRequestUsbPermission: (UsbDevice) -> Unit,
     onRequestShizukuPermission: () -> Unit,
-    onStartRawUsbCarve: (UsbDevice, Int) -> Unit,
+    onStartRawUsbCarve: (UsbDevice, Int, Boolean) -> Unit,
+    onInspectUsbMbr: (UsbDevice) -> Unit = {},
+    onRestoreUsbBootSector: (UsbDevice, Long, Long) -> Unit = { _, _, _ -> },
+    onDismissMbrReport: () -> Unit = {},
+    onDumpRawUsbImage: (UsbDevice) -> Unit = {},
     onStartShizukuCarve: (String) -> Unit,
     onRefresh: () -> Unit,
     onStopScan: () -> Unit,
@@ -101,9 +111,9 @@ fun UsbOtgView(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = if (isAr)
-                            "لماذا يطلب الهاتف فرمتة بطاقة الـ SD / الـ USB؟"
+                            "استرجاع جنائي متقدم للـ USB والـ SD التالفة (بدون حد 256MB)"
                         else
-                            "Why Does Android Request Formatting the SD/USB?",
+                            "Forensic Full-Capacity USB & SD Recovery (No 256MB Cap)",
                         style = MaterialTheme.typography.titleSmall.copy(
                             fontWeight = FontWeight.Bold,
                             color = AmberWarning
@@ -115,11 +125,11 @@ fun UsbOtgView(
 
                 Text(
                     text = if (isAr)
-                        "عند تلف جدول الأقسام أو استخدام تنسيق غير مدعوم من أندرويد (مثل NTFS أو ملفات مكسورة)، يرفض النظام تحميل الذاكرة ويطلب تهيئتها مما يدمر بياناتك.\n" +
-                        "✅ يوفر التطبيق حلاً مباشراً عبر الاتصال بقطاعات الـ USB الخام (SCSI BOT) ودعم صلاحيات سيزوكي (Shizuku) لقراءة الملفات مباشرة بدون فورمات!"
+                        "• يفحص السعة الحقيقية الكاملة للبطاقة عبر أوامر SCSI (READ CAPACITY 10) مع تخطي ذكي للقطاعات الفارغة والتالفة.\n" +
+                        "• محرك Streaming State Machine لاستخراج الفيديوهات الكبيرة (MP4/MOV/3GP)، الصور (JPEG/PNG/WEBP)، الصوتيات (MP3/WAV)، المستندات (PDF/DOCX/ZIP)، وقواعد بيانات SQLite/WhatsApp في مجلدات مصنفة."
                     else
-                        "When an SD card has corrupted partition tables or an unsupported filesystem (NTFS, EXT4, RAW), Android cannot mount it and demands formatting.\n" +
-                        "✅ OpenFileRescue bypasses Android's filesystem mount by reading raw SCSI sectors directly over USB Host and Shizuku privileges without formatting or data loss!",
+                        "• Scans full real drive capacity via SCSI READ CAPACITY(10) with smart zero-block & bad-sector skipping.\n" +
+                        "• Multi-chunk Streaming State Machine extracts large MP4/MOV/3GP videos, JPEG/PNG/WEBP photos, MP3/WAV audio, PDF/DOCX/ZIP archives & SQLite/WhatsApp DBs into categorized subfolders.",
                     style = MaterialTheme.typography.bodySmall.copy(
                         color = Slate400,
                         lineHeight = 16.sp
@@ -155,7 +165,7 @@ fun UsbOtgView(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = if (isAr) "استرجاع مباشر من القطاعات الخام..." else "Direct Sector Carving...",
+                                text = if (isAr) "استرجاع متدفق من القطاعات الخام..." else "Streaming Raw Sector Carving...",
                                 style = MaterialTheme.typography.titleSmall.copy(
                                     fontWeight = FontWeight.Bold,
                                     color = CyanAccent
@@ -232,10 +242,26 @@ fun UsbOtgView(
                     ) {
                         Icon(Icons.Default.Stop, contentDescription = "Stop", tint = Color.White)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(if (isAr) "إيقاف الاسترجاع" else "Stop Recovery", color = Color.White)
+                        Text(if (isAr) "إيقاف وحفظ نقطة الاستكمال" else "Pause & Save Checkpoint", color = Color.White)
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(14.dp))
+        }
+
+        // MBR / Boot Sector Diagnostic Report Card (if inspected)
+        uiState.mbrReport?.let { report ->
+            val firstUsbDevice = uiState.connectedUsbDevices.firstOrNull()?.device
+            MbrBootSectorReportCard(
+                report = report,
+                isAr = isAr,
+                onDismiss = onDismissMbrReport,
+                onRestoreBackup = {
+                    if (firstUsbDevice != null && report.backupSectorLba >= 0L) {
+                        onRestoreUsbBootSector(firstUsbDevice, report.backupSectorLba, report.targetRestoreLba)
+                    }
+                }
+            )
             Spacer(modifier = Modifier.height(14.dp))
         }
 
@@ -309,8 +335,12 @@ fun UsbOtgView(
                     usbInfo = usbInfo,
                     isAr = isAr,
                     isCarving = uiState.isUsbCarving,
+                    isInspectingMbr = uiState.isInspectingMbr,
                     onRequestPermission = { onRequestUsbPermission(usbInfo.device) },
-                    onStartCarve = { onStartRawUsbCarve(usbInfo.device, 256) }
+                    onStartFullCarve = { onStartRawUsbCarve(usbInfo.device, 0, false) },
+                    onResumeCarve = { onStartRawUsbCarve(usbInfo.device, 0, true) },
+                    onInspectMbr = { onInspectUsbMbr(usbInfo.device) },
+                    onDumpImage = { onDumpRawUsbImage(usbInfo.device) }
                 )
                 Spacer(modifier = Modifier.height(8.dp))
             }
@@ -368,9 +398,9 @@ fun UsbOtgView(
             Column(modifier = Modifier.padding(14.dp)) {
                 Text(
                     text = if (isAr)
-                        "تتيح صلاحيات سيزوكي للتطبيق الوصول كـ Root/ADB إلى مسارات النظام المحمية مثل /mnt/media_rw و /dev/block لاستخراج الملفات من بطاقات الذاكرة التي يرفض النظام الوصول لها."
+                        "تتيح صلاحيات سيزوكي للتطبيق الوصول كـ Root/ADB إلى مسارات النظام المحمية مثل /mnt/media_rw و /dev/block/sdX مع قراءة السعة الحقيقية من /sys/class/block/sdX/size."
                     else
-                        "Shizuku allows elevated ADB/Root permissions to read protected system block nodes (/mnt/media_rw, /dev/block) bypassing Android sandbox restrictions.",
+                        "Shizuku enables elevated ADB/Root access to /mnt/media_rw and /dev/block/sdX, reading full capacity from /sys/class/block/sdX/size.",
                     style = MaterialTheme.typography.bodySmall.copy(color = Slate400, fontSize = 12.sp)
                 )
 
@@ -439,7 +469,7 @@ fun UsbOtgView(
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                                     modifier = Modifier.height(28.dp)
                                 ) {
-                                    Text(if (isAr) "فحص واستخراج" else "Carve", fontSize = 10.sp, color = CyanAccent)
+                                    Text(if (isAr) "فحص كامل السعة" else "Full Carve", fontSize = 10.sp, color = CyanAccent)
                                 }
                             }
                         }
@@ -500,13 +530,21 @@ private fun UsbDeviceItem(
     usbInfo: UsbDeviceInfo,
     isAr: Boolean,
     isCarving: Boolean,
+    isInspectingMbr: Boolean,
     onRequestPermission: () -> Unit,
-    onStartCarve: () -> Unit
+    onStartFullCarve: () -> Unit,
+    onResumeCarve: () -> Unit,
+    onInspectMbr: () -> Unit,
+    onDumpImage: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, if (usbInfo.hasPermission) CyanAccent.copy(alpha = 0.5f) else AmberWarning.copy(alpha = 0.5f), RoundedCornerShape(12.dp)),
+            .border(
+                1.dp,
+                if (usbInfo.hasPermission) CyanAccent.copy(alpha = 0.5f) else AmberWarning.copy(alpha = 0.5f),
+                RoundedCornerShape(12.dp)
+            ),
         colors = CardDefaults.cardColors(containerColor = Slate900),
         shape = RoundedCornerShape(12.dp)
     ) {
@@ -554,6 +592,28 @@ private fun UsbDeviceItem(
                 }
             }
 
+            if (usbInfo.savedCheckpointBytes > 0L) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(AmberWarning.copy(alpha = 0.12f))
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = if (isAr)
+                            "نقطة استكمال محفوظة عند: ${FileRescueManager.formatFileSize(usbInfo.savedCheckpointBytes)}"
+                        else
+                            "Saved recovery checkpoint at: ${FileRescueManager.formatFileSize(usbInfo.savedCheckpointBytes)}",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = AmberWarning,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    )
+                }
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
 
             if (!usbInfo.hasPermission) {
@@ -575,8 +635,9 @@ private fun UsbDeviceItem(
                     )
                 }
             } else {
+                // Primary Full-Capacity Carve Button
                 Button(
-                    onClick = onStartCarve,
+                    onClick = onStartFullCarve,
                     enabled = !isCarving,
                     colors = ButtonDefaults.buttonColors(containerColor = CyanAccent),
                     shape = RoundedCornerShape(8.dp),
@@ -588,10 +649,186 @@ private fun UsbDeviceItem(
                     Icon(Icons.Default.Bolt, contentDescription = null, tint = Color.Black)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (isAr) "فحص USB تالف / استرجاع خام" else "Scan Corrupted USB / Raw Carve",
+                        text = if (isAr)
+                            "فحص كامل السعة واستخراج الخام (Full Capacity)"
+                        else
+                            "Full-Capacity Raw Carve (All Formats)",
                         color = Color.Black,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
+                    )
+                }
+
+                // Resume from Checkpoint button if available
+                if (usbInfo.savedCheckpointBytes > 0L) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = onResumeCarve,
+                        enabled = !isCarving,
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldRescue),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .testTag("resume_raw_usb_carve_button")
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isAr)
+                                "استكمال الفحص من (${FileRescueManager.formatFileSize(usbInfo.savedCheckpointBytes)})"
+                            else
+                                "Resume Scan from ${FileRescueManager.formatFileSize(usbInfo.savedCheckpointBytes)}",
+                            color = Color.Black,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Secondary Forensic Tools: MBR Boot Sector Repair & Raw .img Dump
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onInspectMbr,
+                        enabled = !isCarving && !isInspectingMbr,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(38.dp)
+                            .testTag("inspect_mbr_button")
+                    ) {
+                        Icon(Icons.Default.Build, contentDescription = null, tint = AmberWarning, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isAr) "إصلاح قطاع الإقلاع" else "MBR / Boot Fix",
+                            color = AmberWarning,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = onDumpImage,
+                        enabled = !isCarving,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(38.dp)
+                            .testTag("dump_raw_img_button")
+                    ) {
+                        Icon(Icons.Default.Save, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isAr) "نسخة خام (.img)" else "Dump Raw .img",
+                            color = CyanAccent,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MbrBootSectorReportCard(
+    report: MbrBootSectorReport,
+    isAr: Boolean,
+    onDismiss: () -> Unit,
+    onRestoreBackup: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, AmberWarning, RoundedCornerShape(12.dp)),
+        colors = CardDefaults.cardColors(containerColor = Slate900),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Build, contentDescription = null, tint = AmberWarning, modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (isAr) "تقرير فحص وإصلاح قطاع الإقلاع (MBR / Boot Sector)" else "MBR & Boot Sector Forensic Diagnostic",
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = AmberWarning
+                        )
+                    )
+                }
+                IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = Slate400)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                text = report.statusMessage,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    color = if (report.has55AaSignature || report.isRestored) EmeraldRescue else RoseCorrupted,
+                    fontWeight = FontWeight.SemiBold
+                )
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            if (report.lba0HexDump.isNotEmpty()) {
+                Text(
+                    text = if (isAr) "تفريغ القطاع الأول (LBA 0 Hex):" else "LBA 0 Sector Hex Dump:",
+                    style = MaterialTheme.typography.labelSmall.copy(color = Slate400)
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Slate800)
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = report.lba0HexDump,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = CyanAccent
+                        )
+                    )
+                }
+            }
+
+            if (report.backupBootSectorFound && !report.isRestored) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = onRestoreBackup,
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldRescue),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(40.dp)
+                        .testTag("restore_boot_sector_button")
+                ) {
+                    Icon(Icons.Default.Build, contentDescription = null, tint = Color.Black)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isAr)
+                            "استعادة قطاع الإقلاع الاحتياطي (LBA #${report.backupSectorLba} -> LBA #${report.targetRestoreLba})"
+                        else
+                            "Restore Backup Boot Sector (LBA #${report.backupSectorLba} -> LBA #${report.targetRestoreLba})",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
                     )
                 }
             }

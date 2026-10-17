@@ -37,6 +37,7 @@ object FileCarver {
     private val FLAC_HEADER = "fLaC".toByteArray(Charsets.US_ASCII)
     private val OGG_HEADER = "OggS".toByteArray(Charsets.US_ASCII)
     private val SQLITE_HEADER = "SQLite format 3\u0000".toByteArray(Charsets.US_ASCII)
+    private val SQLITE_HEADER_ALT = "Sqlite format 3\u0000".toByteArray(Charsets.US_ASCII)
 
     fun inspectFile(file: File): CarveResult {
         if (!file.exists() || file.length() == 0L) {
@@ -332,9 +333,9 @@ object FileCarver {
         }
 
         // 11. SQLite Database
-        if (startsWith(header, SQLITE_HEADER)) {
+        if (startsWith(header, SQLITE_HEADER) || startsWith(header, SQLITE_HEADER_ALT)) {
             return CarveResult(
-                category = FileCategory.OTHER,
+                category = FileCategory.DATABASE,
                 detectedExtension = "db",
                 mimeType = "application/vnd.sqlite3",
                 magicSignature = "SQLite format 3",
@@ -429,6 +430,7 @@ object FileCarver {
             "mp4", "mkv", "avi", "mov", "3gp", "webm", "flv" -> FileCategory.VIDEO
             "mp3", "m4a", "wav", "aac", "ogg", "amr", "flac" -> FileCategory.AUDIO
             "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv" -> FileCategory.DOCUMENT
+            "db", "sqlite", "sqlite3", "crypt14", "crypt15" -> FileCategory.DATABASE
             "zip", "rar", "7z", "tar", "gz", "apk" -> FileCategory.ARCHIVE
             else -> FileCategory.OTHER
         }

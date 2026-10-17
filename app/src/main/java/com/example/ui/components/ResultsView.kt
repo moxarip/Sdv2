@@ -574,6 +574,7 @@ fun getCategoryIcon(category: FileCategory): ImageVector {
         FileCategory.VIDEO -> Icons.Default.Movie
         FileCategory.AUDIO -> Icons.Default.AudioFile
         FileCategory.DOCUMENT -> Icons.Default.Description
+        FileCategory.DATABASE -> Icons.Default.Save
         FileCategory.ARCHIVE -> Icons.Default.Archive
         FileCategory.OTHER -> Icons.AutoMirrored.Filled.InsertDriveFile
     }

@@ -1,10 +1,8 @@
 package com.example.engine
 
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -12,34 +10,61 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
-import com.example.model.FileCategory
-import com.example.model.FileHealthState
-import com.example.model.FileSourceType
+import com.example.model.MbrBootSectorReport
 import com.example.model.RescuedFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.UUID
 import kotlin.coroutines.coroutineContext
+import kotlin.math.min
 
 data class UsbDeviceInfo(
     val device: UsbDevice,
     val deviceName: String,
     val vendorName: String,
     val isMassStorage: Boolean,
-    val hasPermission: Boolean
+    val hasPermission: Boolean,
+    val savedCheckpointBytes: Long = 0L,
+    val detectedCapacityBytes: Long = 0L
 )
 
 object UsbOtgManager {
 
     const val ACTION_USB_PERMISSION = "com.example.USB_PERMISSION"
+    private const val PREFS_CHECKPOINTS = "usb_forensic_checkpoints"
+
+    data class ScsiCapacity(
+        val totalBlocks: Long,
+        val blockSize: Int,
+        val totalBytes: Long
+    )
 
     fun getUsbManager(context: Context): UsbManager {
         return context.getSystemService(Context.USB_SERVICE) as UsbManager
+    }
+
+    private fun getDeviceKey(device: UsbDevice): String {
+        return "usb_${device.vendorId}_${device.productId}_${device.deviceName}"
+    }
+
+    fun getSavedCheckpointOffset(context: Context, device: UsbDevice): Long {
+        val prefs = context.getSharedPreferences(PREFS_CHECKPOINTS, Context.MODE_PRIVATE)
+        return prefs.getLong(getDeviceKey(device), 0L)
+    }
+
+    fun saveCheckpointOffset(context: Context, device: UsbDevice, offsetBytes: Long) {
+        val prefs = context.getSharedPreferences(PREFS_CHECKPOINTS, Context.MODE_PRIVATE)
+        prefs.edit().putLong(getDeviceKey(device), offsetBytes).apply()
+    }
+
+    fun clearCheckpoint(context: Context, device: UsbDevice) {
+        val prefs = context.getSharedPreferences(PREFS_CHECKPOINTS, Context.MODE_PRIVATE)
+        prefs.edit().remove(getDeviceKey(device)).apply()
     }
 
     fun listConnectedUsbDevices(context: Context): List<UsbDeviceInfo> {
@@ -54,6 +79,8 @@ object UsbOtgManager {
             } else {
                 "USB Storage Device"
             }
+            val hasPerm = manager.hasPermission(device)
+            val checkpoint = getSavedCheckpointOffset(context, device)
 
             list.add(
                 UsbDeviceInfo(
@@ -61,7 +88,8 @@ object UsbOtgManager {
                     deviceName = productName,
                     vendorName = vendorName,
                     isMassStorage = isStorage,
-                    hasPermission = manager.hasPermission(device)
+                    hasPermission = hasPerm,
+                    savedCheckpointBytes = checkpoint
                 )
             )
         }
@@ -69,7 +97,6 @@ object UsbOtgManager {
     }
 
     private fun isStorageDevice(device: UsbDevice): Boolean {
-        // Check device class or interface classes
         if (device.deviceClass == UsbConstants.USB_CLASS_MASS_STORAGE) return true
         for (i in 0 until device.interfaceCount) {
             val intf = device.getInterface(i)
@@ -112,156 +139,589 @@ object UsbOtgManager {
     }
 
     /**
+     * Queries the true total capacity of the USB storage device using SCSI READ CAPACITY (10) (OpCode 0x25).
+     */
+    fun queryScsiReadCapacity(
+        connection: UsbDeviceConnection,
+        outEndpoint: UsbEndpoint,
+        inEndpoint: UsbEndpoint,
+        tag: Int = 777
+    ): ScsiCapacity {
+        try {
+            val cbw = createReadCapacity10Cbw(tag)
+            val sent = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2000)
+            if (sent > 0) {
+                val resp = ByteArray(8)
+                val read = connection.bulkTransfer(inEndpoint, resp, 8, 2000)
+                val csw = ByteArray(13)
+                connection.bulkTransfer(inEndpoint, csw, 13, 2000)
+
+                if (read == 8) {
+                    val lastLba = ((resp[0].toLong() and 0xFF) shl 24) or
+                            ((resp[1].toLong() and 0xFF) shl 16) or
+                            ((resp[2].toLong() and 0xFF) shl 8) or
+                            (resp[3].toLong() and 0xFF)
+                    val blockLen = (((resp[4].toInt() and 0xFF) shl 24) or
+                            ((resp[5].toInt() and 0xFF) shl 16) or
+                            ((resp[6].toInt() and 0xFF) shl 8) or
+                            (resp[7].toInt() and 0xFF)).coerceIn(512, 4096)
+
+                    if (lastLba > 0L && lastLba < 0xFFFFFFFFL) {
+                        val totalBlocks = lastLba + 1L
+                        return ScsiCapacity(
+                            totalBlocks = totalBlocks,
+                            blockSize = blockLen,
+                            totalBytes = totalBlocks * blockLen.toLong()
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Fallback if device does not answer READ CAPACITY (10)
+        return ScsiCapacity(
+            totalBlocks = 0L,
+            blockSize = 512,
+            totalBytes = 0L
+        )
+    }
+
+    /**
      * Low-level SCSI / USB Bulk-Only Transport (BOT) direct sector carver.
-     * This connects directly to the USB Mass Storage endpoints, sending READ(10) SCSI commands
-     * to extract raw data blocks from the SD card even when Android rejects mounting it
-     * and displays "Tap to format".
+     * Connects directly to the USB Mass Storage endpoints, queries actual drive capacity via
+     * SCSI READ CAPACITY(10), and streams all sectors through FileCarverEngine's Streaming State Machine.
+     *
+     * @param maxMegaBytesToScan 0 = Scan Full Real Capacity of the USB drive (No 256MB limit!).
+     * @param resumeFromCheckpoint If true, resumes from the last saved LBA offset.
      */
     suspend fun carveRawUsbStorage(
         context: Context,
         device: UsbDevice,
-        maxMegaBytesToScan: Int = 128,
-        onProgress: suspend (scannedBytes: Long, filesFound: Int, currentPhase: String) -> Unit
+        maxMegaBytesToScan: Int = 0, // 0 = Full Drive Capacity
+        resumeFromCheckpoint: Boolean = false,
+        onProgress: suspend (scannedBytes: Long, totalBytes: Long, filesFound: Int, currentPhase: String) -> Unit
     ): List<RescuedFile> = withContext(Dispatchers.IO) {
         val manager = getUsbManager(context)
         if (!manager.hasPermission(device)) {
             return@withContext emptyList()
         }
 
-        val connection: UsbDeviceConnection? = manager.openDevice(device)
-        if (connection == null) {
-            return@withContext emptyList()
-        }
-
-        val rescuedFiles = mutableListOf<RescuedFile>()
+        val connection: UsbDeviceConnection = manager.openDevice(device) ?: return@withContext emptyList()
+        val targetRescueDir = FileRescueManager.getRescueDirectory(context)
+        val session = FileCarverEngine.StreamingCarverSession(targetRescueDir)
 
         try {
-            // Find Mass Storage Interface
-            var storageInterface: UsbInterface? = null
-            for (i in 0 until device.interfaceCount) {
-                val intf = device.getInterface(i)
-                if (intf.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE || intf.interfaceClass == 0x08) {
-                    storageInterface = intf
-                    break
-                }
-            }
-
-            if (storageInterface == null && device.interfaceCount > 0) {
-                storageInterface = device.getInterface(0)
-            }
-
-            if (storageInterface == null) {
+            val endpoints = claimMassStorageEndpoints(device, connection) ?: run {
                 connection.close()
                 return@withContext emptyList()
             }
+            val (storageInterface, inEndpoint, outEndpoint) = endpoints
 
-            if (!connection.claimInterface(storageInterface, true)) {
-                connection.close()
-                return@withContext emptyList()
+            onProgress(0L, 0L, 0, "Querying SCSI Drive Capacity (READ CAPACITY 10)...")
+
+            val capacity = queryScsiReadCapacity(connection, outEndpoint, inEndpoint, 900)
+            val sectorSize = capacity.blockSize.coerceAtLeast(512)
+            val realTotalBytes = if (capacity.totalBytes > 0L) {
+                capacity.totalBytes
+            } else if (maxMegaBytesToScan > 0) {
+                maxMegaBytesToScan.toLong() * 1024L * 1024L
+            } else {
+                32L * 1024L * 1024L * 1024L // 32GB probe ceiling if capacity command unsupported
             }
 
-            // Find bulk in and bulk out endpoints
-            var inEndpoint: UsbEndpoint? = null
-            var outEndpoint: UsbEndpoint? = null
-
-            for (i in 0 until storageInterface.endpointCount) {
-                val ep = storageInterface.getEndpoint(i)
-                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    if (ep.direction == UsbConstants.USB_DIR_IN) {
-                        inEndpoint = ep
-                    } else if (ep.direction == UsbConstants.USB_DIR_OUT) {
-                        outEndpoint = ep
-                    }
-                }
+            val targetScanBytes = if (maxMegaBytesToScan > 0) {
+                realTotalBytes.coerceAtMost(maxMegaBytesToScan.toLong() * 1024L * 1024L)
+            } else {
+                realTotalBytes
             }
 
-            if (inEndpoint == null || outEndpoint == null) {
-                connection.releaseInterface(storageInterface)
-                connection.close()
-                return@withContext emptyList()
+            val startOffsetBytes = if (resumeFromCheckpoint) {
+                getSavedCheckpointOffset(context, device).coerceIn(0L, (targetScanBytes - sectorSize).coerceAtLeast(0L))
+            } else {
+                0L
             }
 
-            onProgress(0, 0, "Initializing USB BOT & SCSI Communication")
-
-            val sectorSize = 512
-            val sectorsPerBatch = 64 // 32 KB per chunk
+            val sectorsPerBatch = 256 // 128 KB per SCSI transfer for high-speed streaming
             val chunkSize = sectorsPerBatch * sectorSize
-            val maxBytes = maxMegaBytesToScan.toLong() * 1024L * 1024L
-            val targetRescueDir = FileRescueManager.getRescueDirectory(context)
 
-            var currentLba = 0L
-            var totalBytesRead = 0L
+            var currentLba = startOffsetBytes / sectorSize
+            var totalBytesScanned = currentLba * sectorSize
             var tagCounter = 1000
+            var badSectorsSkipped = 0
+            var consecutiveFailures = 0
 
-            // Ring buffer for scanning magic bytes across sector boundaries
-            var leftoverBytes = ByteArray(0)
+            val readBuffer = ByteArray(chunkSize)
 
-            while (totalBytesRead < maxBytes && coroutineContext.isActive) {
-                val cbw = createRead10Cbw(tagCounter++, currentLba, sectorsPerBatch, chunkSize)
-                val outSent = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2000)
+            while (totalBytesScanned < targetScanBytes && coroutineContext.isActive) {
+                val remainingBytes = targetScanBytes - totalBytesScanned
+                val currentBatchSectors = min(sectorsPerBatch.toLong(), (remainingBytes / sectorSize).coerceAtLeast(1L)).toInt()
+                val currentTransferLen = currentBatchSectors * sectorSize
+
+                val cbw = createRead10Cbw(tagCounter++, currentLba, currentBatchSectors, currentTransferLen)
+                val outSent = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2500)
 
                 if (outSent <= 0) {
-                    // Try soft recovery or break
-                    break
+                    consecutiveFailures++
+                    if (consecutiveFailures > 32) break
+                    currentLba += currentBatchSectors
+                    totalBytesScanned += currentTransferLen
+                    continue
                 }
 
-                val readBuffer = ByteArray(chunkSize)
-                val bytesRead = connection.bulkTransfer(inEndpoint, readBuffer, chunkSize, 4000)
+                val bytesRead = connection.bulkTransfer(inEndpoint, readBuffer, currentTransferLen, 4000)
 
-                // Read Command Status Wrapper (CSW)
+                // Always consume 13-byte CSW
                 val csw = ByteArray(13)
                 connection.bulkTransfer(inEndpoint, csw, 13, 2000)
 
                 if (bytesRead <= 0) {
-                    currentLba += sectorsPerBatch
-                    totalBytesRead += chunkSize
+                    badSectorsSkipped += currentBatchSectors
+                    consecutiveFailures++
+                    // If drive capacity wasn't reported and we hit end of media, stop
+                    if (capacity.totalBytes <= 0L && consecutiveFailures > 128) {
+                        break
+                    }
+                    currentLba += currentBatchSectors
+                    totalBytesScanned += currentTransferLen
                     continue
                 }
 
-                totalBytesRead += bytesRead
-                currentLba += sectorsPerBatch
+                consecutiveFailures = 0
+                val diskOffset = currentLba * sectorSize
 
-                // Combine with leftover bytes from previous chunk to avoid missing headers
-                val combinedBytes = if (leftoverBytes.isNotEmpty()) {
-                    val combined = ByteArray(leftoverBytes.size + bytesRead)
-                    System.arraycopy(leftoverBytes, 0, combined, 0, leftoverBytes.size)
-                    System.arraycopy(readBuffer, 0, combined, leftoverBytes.size, bytesRead)
-                    combined
-                } else {
-                    readBuffer.copyOf(bytesRead)
-                }
+                // Feed directly into the Streaming State Machine (handles multi-chunk MP4, ZIP, PDF, WEBP, SQLite, JPEG, PNG)
+                val newlyCarved = session.feedChunk(readBuffer, bytesRead, diskOffset)
 
-                // Carve files from raw byte buffer
-                val carved = scanAndCarveBuffer(combinedBytes, currentLba * sectorSize, targetRescueDir)
-                if (carved.isNotEmpty()) {
-                    rescuedFiles.addAll(carved)
-                }
+                currentLba += currentBatchSectors
+                totalBytesScanned += bytesRead
+                saveCheckpointOffset(context, device, totalBytesScanned)
 
-                leftoverBytes = if (bytesRead >= 1024) {
-                    readBuffer.copyOfRange(bytesRead - 1024, bytesRead)
-                } else {
-                    readBuffer.copyOf(bytesRead)
-                }
-
-                if (totalBytesRead % (1024 * 1024) == 0L || carved.isNotEmpty()) {
+                if (totalBytesScanned % (1024 * 1024) < chunkSize || newlyCarved.isNotEmpty()) {
+                    val capStr = FileRescueManager.formatFileSize(targetScanBytes)
+                    val curStr = FileRescueManager.formatFileSize(totalBytesScanned)
                     onProgress(
-                        totalBytesRead,
-                        rescuedFiles.size,
-                        "Carving USB Block LBA #$currentLba (${FileRescueManager.formatFileSize(totalBytesRead)})"
+                        totalBytesScanned,
+                        targetScanBytes,
+                        session.rescuedFiles.size,
+                        "LBA #$currentLba ($curStr / $capStr) • Bad Sectors: $badSectorsSkipped • Zero-Skipped: ${session.zeroBlocksSkipped}"
                     )
+                }
+            }
+
+            session.finishSession()
+            if (totalBytesScanned >= targetScanBytes) {
+                clearCheckpoint(context, device)
+            }
+
+            connection.releaseInterface(storageInterface)
+            connection.close()
+
+            onProgress(
+                totalBytesScanned,
+                targetScanBytes,
+                session.rescuedFiles.size,
+                "USB Carving Complete! Rescued ${session.rescuedFiles.size} files."
+            )
+        } catch (e: Exception) {
+            e.printStackTrace()
+            session.finishSession()
+            try { connection.close() } catch (_: Exception) {}
+        }
+
+        session.rescuedFiles
+    }
+
+    /**
+     * Inspects LBA 0 (MBR / Primary Boot Sector) and searches for FAT32 (LBA 6) or exFAT (LBA 12)
+     * backup boot sectors to diagnose and repair corrupted partition tables / boot sectors.
+     */
+    suspend fun inspectMbrAndBootSector(
+        context: Context,
+        device: UsbDevice
+    ): MbrBootSectorReport = withContext(Dispatchers.IO) {
+        val manager = getUsbManager(context)
+        if (!manager.hasPermission(device)) {
+            return@withContext MbrBootSectorReport(
+                deviceName = device.deviceName,
+                statusMessage = "USB Permission not granted"
+            )
+        }
+
+        val connection = manager.openDevice(device) ?: return@withContext MbrBootSectorReport(
+            deviceName = device.deviceName,
+            statusMessage = "Unable to open USB device connection"
+        )
+
+        try {
+            val endpoints = claimMassStorageEndpoints(device, connection) ?: run {
+                connection.close()
+                return@withContext MbrBootSectorReport(
+                    deviceName = device.deviceName,
+                    statusMessage = "No Bulk Mass Storage endpoints found"
+                )
+            }
+            val (storageInterface, inEndpoint, outEndpoint) = endpoints
+
+            // Read LBA 0 (512 bytes)
+            val lba0 = readSingleSector(connection, outEndpoint, inEndpoint, 0L, 2001)
+            if (lba0 == null) {
+                connection.releaseInterface(storageInterface)
+                connection.close()
+                return@withContext MbrBootSectorReport(
+                    deviceName = device.deviceName,
+                    statusMessage = "Failed to read LBA 0 (Sector 0 unreadable)"
+                )
+            }
+
+            val lba0Hex = FileCarver.formatHexDump(lba0, maxLines = 16)
+            val has55Aa = (lba0[510] == 0x55.toByte() && lba0[511] == 0xAA.toByte())
+
+            val oemString = String(lba0, 3, 8, Charsets.US_ASCII).trim()
+            val fat32Label = String(lba0, 82, 8, Charsets.US_ASCII).trim()
+
+            // Check first MBR partition entry at 0x1BE (offset 446) for partition start LBA
+            val part1StartLba = readUint32LE(lba0, 446 + 8)
+            val part1Type = lba0[446 + 4].toInt() and 0xFF
+
+            val detectedFs = when {
+                oemString.contains("EXFAT", ignoreCase = true) -> "exFAT Superblock (LBA 0)"
+                fat32Label.contains("FAT32", ignoreCase = true) || oemString.contains("MSDOS", ignoreCase = true) -> "FAT32 Boot Sector"
+                oemString.contains("NTFS", ignoreCase = true) -> "NTFS Boot Sector"
+                part1Type in listOf(0x0B, 0x0C) -> "MBR Partition Table (FAT32 at LBA $part1StartLba)"
+                part1Type == 0x07 -> "MBR Partition Table (exFAT/NTFS at LBA $part1StartLba)"
+                has55Aa -> "Generic MBR / Boot Sector (55 AA valid)"
+                else -> "Corrupted Boot Sector (Missing 55 AA signature)"
+            }
+
+            // Probe candidate Backup Boot Sectors: LBA 6 (FAT32), LBA 12 (exFAT), and Partition1 + 6 / + 12
+            val candidateLbas = mutableListOf(6L, 12L)
+            if (part1StartLba in 1L..1000000L) {
+                candidateLbas.add(part1StartLba)
+                candidateLbas.add(part1StartLba + 6L)
+                candidateLbas.add(part1StartLba + 12L)
+            }
+
+            var foundBackupLba = -1L
+            var targetRestoreLba = 0L
+            var backupSectorBytes: ByteArray? = null
+
+            for (candidate in candidateLbas.distinct()) {
+                val sec = readSingleSector(connection, outEndpoint, inEndpoint, candidate, 2010 + candidate.toInt())
+                if (sec != null && sec[510] == 0x55.toByte() && sec[511] == 0xAA.toByte()) {
+                    val candOem = String(sec, 3, 8, Charsets.US_ASCII)
+                    val candFat = String(sec, 82, 8, Charsets.US_ASCII)
+                    if (candOem.contains("EXFAT", true) ||
+                        candOem.contains("MSDOS", true) ||
+                        candOem.contains("mkfs", true) ||
+                        candFat.contains("FAT", true)
+                    ) {
+                        foundBackupLba = candidate
+                        backupSectorBytes = sec
+                        targetRestoreLba = if (candidate >= part1StartLba && part1StartLba > 0L) {
+                            part1StartLba
+                        } else {
+                            0L
+                        }
+                        break
+                    }
                 }
             }
 
             connection.releaseInterface(storageInterface)
             connection.close()
 
-            onProgress(totalBytesRead, rescuedFiles.size, "USB Carving Complete")
+            val backupHex = if (backupSectorBytes != null) {
+                FileCarver.formatHexDump(backupSectorBytes, maxLines = 10)
+            } else ""
+
+            val statusMsg = buildString {
+                if (has55Aa) {
+                    append("LBA 0 has valid 0x55AA signature ($detectedFs). ")
+                } else {
+                    append("WARNING: LBA 0 is missing 0x55AA boot signature! ")
+                }
+                if (foundBackupLba != -1L) {
+                    append("Valid Backup Boot Sector found at LBA #$foundBackupLba (can restore to LBA #$targetRestoreLba).")
+                } else {
+                    append("No valid FAT32/exFAT backup boot sector detected at standard offsets.")
+                }
+            }
+
+            MbrBootSectorReport(
+                deviceName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) device.productName ?: device.deviceName else device.deviceName,
+                lba0HexDump = lba0Hex,
+                has55AaSignature = has55Aa,
+                detectedFileSystemType = detectedFs,
+                backupBootSectorFound = foundBackupLba != -1L,
+                backupSectorLba = foundBackupLba,
+                targetRestoreLba = targetRestoreLba,
+                backupHexDump = backupHex,
+                canRestoreInPlace = foundBackupLba != -1L,
+                statusMessage = statusMsg,
+                isRestored = false
+            )
+        } catch (e: Exception) {
+            try { connection.close() } catch (_: Exception) {}
+            MbrBootSectorReport(
+                deviceName = device.deviceName,
+                statusMessage = "MBR diagnostic error: ${e.localizedMessage}"
+            )
+        }
+    }
+
+    /**
+     * Restores the valid Backup Boot Sector (from LBA 6 or LBA 12) to the primary boot sector
+     * AND saves a backup copy of both sectors to Downloads/OpenFileRescue/BootSectors/ first.
+     */
+    suspend fun restoreBackupBootSector(
+        context: Context,
+        device: UsbDevice,
+        backupLba: Long,
+        targetLba: Long
+    ): MbrBootSectorReport = withContext(Dispatchers.IO) {
+        val manager = getUsbManager(context)
+        val connection = manager.openDevice(device) ?: return@withContext MbrBootSectorReport(
+            deviceName = device.deviceName,
+            statusMessage = "Could not open USB device for boot sector repair"
+        )
+
+        try {
+            val endpoints = claimMassStorageEndpoints(device, connection) ?: run {
+                connection.close()
+                return@withContext MbrBootSectorReport(
+                    deviceName = device.deviceName,
+                    statusMessage = "Mass Storage endpoints unavailable"
+                )
+            }
+            val (storageInterface, inEndpoint, outEndpoint) = endpoints
+
+            val currentPrimary = readSingleSector(connection, outEndpoint, inEndpoint, targetLba, 3001)
+            val backupSector = readSingleSector(connection, outEndpoint, inEndpoint, backupLba, 3002)
+
+            if (backupSector == null || backupSector[510] != 0x55.toByte() || backupSector[511] != 0xAA.toByte()) {
+                connection.releaseInterface(storageInterface)
+                connection.close()
+                return@withContext MbrBootSectorReport(
+                    deviceName = device.deviceName,
+                    statusMessage = "Backup Boot Sector at LBA #$backupLba is invalid; aborting repair to protect drive."
+                )
+            }
+
+            // 1. Save forensic backup of original and repaired boot sectors on phone storage
+            val bootDir = File(FileRescueManager.getRescueDirectory(context), "BootSectors").apply { mkdirs() }
+            if (currentPrimary != null) {
+                File(bootDir, "original_lba${targetLba}_backup.bin").writeBytes(currentPrimary)
+            }
+            val patchedFile = File(bootDir, "repaired_boot_sector_from_lba${backupLba}.bin")
+            patchedFile.writeBytes(backupSector)
+
+            // 2. Send SCSI WRITE(10) (OpCode 0x2A) ONLY for this single 512-byte boot sector repair
+            val writeSuccess = writeSingleSector(connection, outEndpoint, inEndpoint, targetLba, backupSector, 3005)
+
+            connection.releaseInterface(storageInterface)
+            connection.close()
+
+            val hex = FileCarver.formatHexDump(backupSector, maxLines = 16)
+            MbrBootSectorReport(
+                deviceName = device.deviceName,
+                lba0HexDump = hex,
+                has55AaSignature = true,
+                detectedFileSystemType = "Restored Boot Sector from LBA #$backupLba",
+                backupBootSectorFound = true,
+                backupSectorLba = backupLba,
+                targetRestoreLba = targetLba,
+                backupHexDump = hex,
+                canRestoreInPlace = true,
+                statusMessage = if (writeSuccess) {
+                    "Successfully restored Backup Boot Sector (LBA #$backupLba -> LBA #$targetLba) and saved backup to ${patchedFile.name}!"
+                } else {
+                    "Saved repaired Boot Sector image to ${patchedFile.absolutePath} (Hardware write-protected)."
+                },
+                isRestored = true
+            )
+        } catch (e: Exception) {
+            try { connection.close() } catch (_: Exception) {}
+            MbrBootSectorReport(
+                deviceName = device.deviceName,
+                statusMessage = "Boot sector repair error: ${e.localizedMessage}"
+            )
+        }
+    }
+
+    /**
+     * Dumps a raw sector-by-sector disk image (.img) from the damaged USB drive into phone storage
+     * for offline forensic analysis and carving.
+     */
+    suspend fun dumpRawUsbImage(
+        context: Context,
+        device: UsbDevice,
+        maxMegaBytes: Int = 512,
+        onProgress: suspend (copiedBytes: Long, totalBytes: Long, message: String) -> Unit
+    ): File? = withContext(Dispatchers.IO) {
+        val manager = getUsbManager(context)
+        if (!manager.hasPermission(device)) return@withContext null
+        val connection = manager.openDevice(device) ?: return@withContext null
+
+        val imagesDir = File(FileRescueManager.getRescueDirectory(context), "DiskImages").apply { mkdirs() }
+        val imgFile = File(imagesDir, "usb_raw_dump_${System.currentTimeMillis() % 100000}.img")
+
+        try {
+            val endpoints = claimMassStorageEndpoints(device, connection) ?: run {
+                connection.close()
+                return@withContext null
+            }
+            val (storageInterface, inEndpoint, outEndpoint) = endpoints
+
+            val cap = queryScsiReadCapacity(connection, outEndpoint, inEndpoint, 4000)
+            val sectorSize = cap.blockSize.coerceAtLeast(512)
+            val maxBytes = if (cap.totalBytes > 0L) {
+                cap.totalBytes.coerceAtMost(maxMegaBytes.toLong() * 1024L * 1024L)
+            } else {
+                maxMegaBytes.toLong() * 1024L * 1024L
+            }
+
+            val sectorsPerBatch = 128
+            val batchBytes = sectorsPerBatch * sectorSize
+            val buf = ByteArray(batchBytes)
+            val zeroPadding = ByteArray(batchBytes)
+
+            var currentLba = 0L
+            var copiedBytes = 0L
+            var tag = 5000
+
+            BufferedOutputStream(FileOutputStream(imgFile), 128 * 1024).use { bos ->
+                while (copiedBytes < maxBytes && coroutineContext.isActive) {
+                    val cbw = createRead10Cbw(tag++, currentLba, sectorsPerBatch, batchBytes)
+                    val sent = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2000)
+                    if (sent <= 0) break
+
+                    val read = connection.bulkTransfer(inEndpoint, buf, batchBytes, 3500)
+                    val csw = ByteArray(13)
+                    connection.bulkTransfer(inEndpoint, csw, 13, 2000)
+
+                    if (read > 0) {
+                        bos.write(buf, 0, read)
+                        copiedBytes += read
+                    } else {
+                        // Bad sector: write zero-filled placeholder to preserve sector alignment in .img
+                        bos.write(zeroPadding, 0, batchBytes)
+                        copiedBytes += batchBytes
+                    }
+                    currentLba += sectorsPerBatch
+
+                    if (copiedBytes % (2 * 1024 * 1024) < batchBytes) {
+                        onProgress(
+                            copiedBytes,
+                            maxBytes,
+                            "Imaging LBA #$currentLba (${FileRescueManager.formatFileSize(copiedBytes)} / ${FileRescueManager.formatFileSize(maxBytes)})"
+                        )
+                    }
+                }
+                bos.flush()
+            }
+
+            connection.releaseInterface(storageInterface)
+            connection.close()
+            imgFile
         } catch (e: Exception) {
             e.printStackTrace()
             try { connection.close() } catch (_: Exception) {}
+            if (imgFile.exists() && imgFile.length() > 0L) imgFile else null
+        }
+    }
+
+    private fun claimMassStorageEndpoints(
+        device: UsbDevice,
+        connection: UsbDeviceConnection
+    ): Triple<UsbInterface, UsbEndpoint, UsbEndpoint>? {
+        var storageInterface: UsbInterface? = null
+        for (i in 0 until device.interfaceCount) {
+            val intf = device.getInterface(i)
+            if (intf.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE || intf.interfaceClass == 0x08) {
+                storageInterface = intf
+                break
+            }
+        }
+        if (storageInterface == null && device.interfaceCount > 0) {
+            storageInterface = device.getInterface(0)
+        }
+        val intf = storageInterface ?: return null
+        if (!connection.claimInterface(intf, true)) return null
+
+        var inEndpoint: UsbEndpoint? = null
+        var outEndpoint: UsbEndpoint? = null
+        for (i in 0 until intf.endpointCount) {
+            val ep = intf.getEndpoint(i)
+            if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                if (ep.direction == UsbConstants.USB_DIR_IN) {
+                    inEndpoint = ep
+                } else if (ep.direction == UsbConstants.USB_DIR_OUT) {
+                    outEndpoint = ep
+                }
+            }
         }
 
-        rescuedFiles
+        if (inEndpoint == null || outEndpoint == null) {
+            connection.releaseInterface(intf)
+            return null
+        }
+        return Triple(intf, inEndpoint, outEndpoint)
+    }
+
+    private fun readSingleSector(
+        connection: UsbDeviceConnection,
+        outEndpoint: UsbEndpoint,
+        inEndpoint: UsbEndpoint,
+        lba: Long,
+        tag: Int
+    ): ByteArray? {
+        val cbw = createRead10Cbw(tag, lba, 1, 512)
+        val sent = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2000)
+        if (sent <= 0) return null
+        val sector = ByteArray(512)
+        val read = connection.bulkTransfer(inEndpoint, sector, 512, 2500)
+        val csw = ByteArray(13)
+        connection.bulkTransfer(inEndpoint, csw, 13, 2000)
+        return if (read == 512) sector else null
+    }
+
+    private fun writeSingleSector(
+        connection: UsbDeviceConnection,
+        outEndpoint: UsbEndpoint,
+        inEndpoint: UsbEndpoint,
+        lba: Long,
+        sectorData: ByteArray,
+        tag: Int
+    ): Boolean {
+        if (sectorData.size != 512) return false
+        val cbw = createWrite10Cbw(tag, lba, 1, 512)
+        val sentCbw = connection.bulkTransfer(outEndpoint, cbw, cbw.size, 2000)
+        if (sentCbw <= 0) return false
+        val sentData = connection.bulkTransfer(outEndpoint, sectorData, 512, 2500)
+        val csw = ByteArray(13)
+        val cswRead = connection.bulkTransfer(inEndpoint, csw, 13, 2000)
+        return sentData == 512 && cswRead == 13 && csw[12] == 0.toByte()
+    }
+
+    /**
+     * Builds a USB Mass Storage BOT CBW for SCSI READ CAPACITY(10) (OpCode 0x25).
+     */
+    private fun createReadCapacity10Cbw(tag: Int): ByteArray {
+        val buffer = ByteBuffer.allocate(31).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(0x55.toByte()) // 'U'
+        buffer.put(0x53.toByte()) // 'S'
+        buffer.put(0x42.toByte()) // 'B'
+        buffer.put(0x43.toByte()) // 'C'
+        buffer.putInt(tag)
+        buffer.putInt(8) // 8-byte response: Last LBA (4B) + Block Length (4B)
+        buffer.put(0x80.toByte()) // Direction: IN
+        buffer.put(0.toByte()) // LUN 0
+        buffer.put(10.toByte()) // CDB length = 10
+        buffer.put(0x25.toByte()) // SCSI READ CAPACITY (10)
+        while (buffer.position() < 31) {
+            buffer.put(0.toByte())
+        }
+        return buffer.array()
     }
 
     /**
@@ -294,7 +754,6 @@ object UsbOtgManager {
         buffer.put(blockCount.toByte())
         buffer.put(0.toByte()) // Control
 
-        // Pad remaining CDB bytes to 16 bytes
         while (buffer.position() < 31) {
             buffer.put(0.toByte())
         }
@@ -302,121 +761,44 @@ object UsbOtgManager {
         return buffer.array()
     }
 
-    private fun scanAndCarveBuffer(data: ByteArray, streamOffset: Long, outputDir: File): List<RescuedFile> {
-        val list = mutableListOf<RescuedFile>()
-        var offset = 0
+    /**
+     * Builds a SCSI WRITE(10) CBW (OpCode 0x2A) used strictly when the user explicitly triggers
+     * Backup Boot Sector restoration.
+     */
+    private fun createWrite10Cbw(tag: Int, lba: Long, blockCount: Int, transferLength: Int): ByteArray {
+        val buffer = ByteBuffer.allocate(31).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(0x55.toByte())
+        buffer.put(0x53.toByte())
+        buffer.put(0x42.toByte())
+        buffer.put(0x43.toByte())
+        buffer.putInt(tag)
+        buffer.putInt(transferLength)
+        buffer.put(0x00.toByte()) // Flags: 0x00 = Host to Device (Data OUT)
+        buffer.put(0.toByte())
+        buffer.put(10.toByte())
 
-        while (offset < data.size - 16) {
-            // Check JPEG SOI (FF D8 FF)
-            if (data[offset] == 0xFF.toByte() && data[offset + 1] == 0xD8.toByte() && data[offset + 2] == 0xFF.toByte()) {
-                val remaining = data.size - offset
-                val endOffset = findSequence(data, offset, byteArrayOf(0xFF.toByte(), 0xD9.toByte()))
-                val length = if (endOffset != -1) (endOffset - offset + 2).coerceAtMost(remaining) else remaining.coerceAtMost(1024 * 1024)
+        buffer.put(0x2A.toByte()) // OpCode: WRITE(10)
+        buffer.put(0.toByte())
+        buffer.put((lba shr 24).toByte())
+        buffer.put((lba shr 16).toByte())
+        buffer.put((lba shr 8).toByte())
+        buffer.put(lba.toByte())
+        buffer.put(0.toByte())
+        buffer.put((blockCount shr 8).toByte())
+        buffer.put(blockCount.toByte())
+        buffer.put(0.toByte())
 
-                if (length > 2048) { // Minimum realistic photo size
-                    val fileData = data.copyOfRange(offset, offset + length)
-                    val rescued = saveCarvedFile(fileData, "jpg", "image/jpeg", FileCategory.PHOTO, "FF D8 FF (JPEG)", streamOffset + offset, outputDir)
-                    if (rescued != null) list.add(rescued)
-                    offset += length
-                    continue
-                }
-            }
-
-            // Check PNG Signature (89 50 4E 47)
-            if (data[offset] == 0x89.toByte() && data[offset + 1] == 0x50.toByte() &&
-                data[offset + 2] == 0x4E.toByte() && data[offset + 3] == 0x47.toByte()) {
-                val endOffset = findSequence(data, offset, "IEND".toByteArray(Charsets.US_ASCII))
-                val length = if (endOffset != -1) (endOffset - offset + 8).coerceAtMost(data.size - offset) else (data.size - offset).coerceAtMost(1024 * 1024)
-
-                if (length > 1024) {
-                    val fileData = data.copyOfRange(offset, offset + length)
-                    val rescued = saveCarvedFile(fileData, "png", "image/png", FileCategory.PHOTO, "89 50 4E 47 (PNG)", streamOffset + offset, outputDir)
-                    if (rescued != null) list.add(rescued)
-                    offset += length
-                    continue
-                }
-            }
-
-            // Check PDF (%PDF)
-            if (data[offset] == 0x25.toByte() && data[offset + 1] == 0x50.toByte() &&
-                data[offset + 2] == 0x44.toByte() && data[offset + 3] == 0x46.toByte()) {
-                val endOffset = findSequence(data, offset, "%%EOF".toByteArray(Charsets.US_ASCII))
-                val length = if (endOffset != -1) (endOffset - offset + 5).coerceAtMost(data.size - offset) else (data.size - offset).coerceAtMost(2 * 1024 * 1024)
-
-                if (length > 512) {
-                    val fileData = data.copyOfRange(offset, offset + length)
-                    val rescued = saveCarvedFile(fileData, "pdf", "application/pdf", FileCategory.DOCUMENT, "%PDF Document", streamOffset + offset, outputDir)
-                    if (rescued != null) list.add(rescued)
-                    offset += length
-                    continue
-                }
-            }
-
-            offset += 512 // Advance by sector boundary
+        while (buffer.position() < 31) {
+            buffer.put(0.toByte())
         }
-
-        return list
+        return buffer.array()
     }
 
-    private fun findSequence(data: ByteArray, startOffset: Int, sequence: ByteArray): Int {
-        if (data.size - startOffset < sequence.size) return -1
-        for (i in startOffset..(data.size - sequence.size)) {
-            var match = true
-            for (j in sequence.indices) {
-                if (data[i + j] != sequence[j]) {
-                    match = false
-                    break
-                }
-            }
-            if (match) return i
-        }
-        return -1
-    }
-
-    private fun saveCarvedFile(
-        bytes: ByteArray,
-        ext: String,
-        mime: String,
-        category: FileCategory,
-        magic: String,
-        sectorAddress: Long,
-        outputDir: File
-    ): RescuedFile? {
-        return try {
-            if (!outputDir.exists()) outputDir.mkdirs()
-            val fileName = "usb_carved_sec${sectorAddress}_${System.currentTimeMillis() % 10000}.$ext"
-            val targetFile = File(outputDir, fileName)
-
-            FileOutputStream(targetFile).use { out ->
-                out.write(bytes)
-                out.flush()
-            }
-
-            val hexSnippet = FileCarver.formatHexDump(bytes.take(128).toByteArray())
-
-            RescuedFile(
-                id = UUID.randomUUID().toString(),
-                name = fileName,
-                path = targetFile.absolutePath,
-                uri = null,
-                size = targetFile.length(),
-                lastModified = System.currentTimeMillis(),
-                category = category,
-                mimeType = mime,
-                detectedExtension = ext,
-                originalExtension = ext,
-                healthState = FileHealthState.GOOD,
-                healthScore = 88,
-                sourceType = FileSourceType.USB_OTG_RAW_SECTOR,
-                magicSignature = magic,
-                isHeaderValid = true,
-                isFooterValid = true,
-                isRescued = true,
-                rescuedDestinationPath = targetFile.absolutePath,
-                hexSnippet = hexSnippet
-            )
-        } catch (_: Exception) {
-            null
-        }
+    private fun readUint32LE(data: ByteArray, offset: Int): Long {
+        if (offset + 4 > data.size) return 0L
+        return (data[offset].toLong() and 0xFF) or
+                ((data[offset + 1].toLong() and 0xFF) shl 8) or
+                ((data[offset + 2].toLong() and 0xFF) shl 16) or
+                ((data[offset + 3].toLong() and 0xFF) shl 24)
     }
 }

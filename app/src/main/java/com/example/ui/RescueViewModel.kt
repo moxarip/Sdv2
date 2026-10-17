@@ -24,6 +24,7 @@ import com.example.engine.UsbMassStorageManager
 import com.example.engine.UsbOtgManager
 import com.example.model.FileCategory
 import com.example.model.FileHealthState
+import com.example.model.MbrBootSectorReport
 import com.example.model.RepairReport
 import com.example.model.RescuedFile
 import com.example.model.ScanStats
@@ -35,7 +36,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.io.File
 import java.util.Locale
 
 enum class AppTab {
@@ -65,10 +65,11 @@ data class RescueUiState(
     val storageAnalysis: StorageAnalysis = StorageAnalysis(),
     val isAnalyzingStorage: Boolean = false,
     val salvagedFiles: List<RescuedFile> = emptyList(),
+    val isExportingZip: Boolean = false,
     val appLanguage: String = if (Locale.getDefault().language.startsWith("ar")) "ar" else "en",
     val snackbarMessage: String? = null,
 
-    // USB-OTG & Shizuku state
+    // USB-OTG, Forensics & Shizuku state
     val connectedUsbDevices: List<UsbDeviceInfo> = emptyList(),
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_INSTALLED_OR_RUNNING,
     val detectedVolumes: List<DetectedStorageVolume> = emptyList(),
@@ -76,7 +77,9 @@ data class RescueUiState(
     val usbCarveStatus: String = "",
     val usbCarveProgressPercent: Float = 0f,
     val usbRescuedCount: Int = 0,
-    val elevatedBlockNodes: List<String> = emptyList()
+    val elevatedBlockNodes: List<String> = emptyList(),
+    val mbrReport: MbrBootSectorReport? = null,
+    val isInspectingMbr: Boolean = false
 )
 
 class RescueViewModel(application: Application) : AndroidViewModel(application) {
@@ -104,7 +107,6 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
         refreshStorageAnalysis()
         refreshUsbAndShizuku()
 
-        // Register USB receiver
         try {
             val filter = IntentFilter().apply {
                 addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -134,6 +136,8 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(currentTab = tab) }
         if (tab == AppTab.USB_OTG) {
             refreshUsbAndShizuku()
+        } else if (tab == AppTab.SALVAGED) {
+            loadExistingSalvagedFiles()
         }
     }
 
@@ -189,14 +193,25 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun startRawUsbCarve(device: UsbDevice, maxMegaBytes: Int = 128) {
+    /**
+     * Starts full-capacity (or custom range) USB OTG raw sector carving with Streaming State Machine.
+     * @param maxMegaBytes 0 = Full Real Capacity of the USB drive (No 256MB limit!).
+     */
+    fun startRawUsbCarve(
+        device: UsbDevice,
+        maxMegaBytes: Int = 0,
+        resumeFromCheckpoint: Boolean = false
+    ) {
         usbJob?.cancel()
         _uiState.update {
             it.copy(
                 isUsbCarving = true,
-                usbCarveProgressPercent = 0.05f,
+                usbCarveProgressPercent = 0.02f,
                 usbRescuedCount = 0,
-                usbCarveStatus = if (it.appLanguage == "ar") "بدء الاتصال بـ USB وفحص نظام الملفات والقطاعات..." else "Connecting to USB, checking filesystem and raw sectors..."
+                usbCarveStatus = if (it.appLanguage == "ar")
+                    "قراءة السعة الحقيقية للـ USB وبدء محرك الاستخراج المتدفق (Streaming State Machine)..."
+                else
+                    "Querying real USB capacity & starting Streaming State Machine carver..."
             )
         }
 
@@ -204,13 +219,14 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
             val context = getApplication<Application>()
             val massStorageDevices = UsbMassStorageManager.discoverDevices(context)
             val matchedDevice = massStorageDevices.find { it.usbDevice.deviceId == device.deviceId }
-            val maxBytes = maxMegaBytes.toLong() * 1024L * 1024L
+            val maxBytes = if (maxMegaBytes > 0) maxMegaBytes.toLong() * 1024L * 1024L else 0L
 
             val rescued = if (matchedDevice != null) {
                 val sessionResult = UsbMassStorageManager.rescueFromDamagedUsb(
                     context = context,
                     device = matchedDevice,
                     maxBytesToScan = maxBytes,
+                    resumeFromCheckpoint = resumeFromCheckpoint,
                     onProgress = { percent, count, message ->
                         _uiState.update {
                             it.copy(
@@ -227,8 +243,10 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                     context = context,
                     device = device,
                     maxMegaBytesToScan = maxMegaBytes,
-                    onProgress = { scannedBytes, foundCount, phase ->
-                        val percent = if (maxBytes > 0) (scannedBytes.toFloat() / maxBytes.toFloat()).coerceIn(0f, 1f) else 0f
+                    resumeFromCheckpoint = resumeFromCheckpoint,
+                    onProgress = { scannedBytes, totalBytes, foundCount, phase ->
+                        val denom = if (totalBytes > 0L) totalBytes else 1L
+                        val percent = (scannedBytes.toFloat() / denom.toFloat()).coerceIn(0f, 1f)
                         _uiState.update {
                             it.copy(
                                 usbCarveProgressPercent = percent,
@@ -241,6 +259,7 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             loadExistingSalvagedFiles()
+            refreshUsbAndShizuku()
 
             _uiState.update { state ->
                 val newAll = (rescued + state.allFiles).distinctBy { it.id }
@@ -251,9 +270,91 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                     allFiles = newAll,
                     currentTab = AppTab.RESULTS,
                     snackbarMessage = if (state.appLanguage == "ar")
-                        "تم استخراج ${rescued.size} ملف من شريحة الـ USB بنجاح بدون فورمات!"
+                        "تم استخراج وتصنيف ${rescued.size} ملف من الـ USB بنجاح في مجلدات فرعية!"
                     else
-                        "Rescued ${rescued.size} files directly from USB without formatting!"
+                        "Rescued and categorized ${rescued.size} files from USB without formatting!"
+                )
+            }
+        }
+    }
+
+    fun inspectUsbMbr(device: UsbDevice) {
+        _uiState.update { it.copy(isInspectingMbr = true, mbrReport = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = UsbOtgManager.inspectMbrAndBootSector(getApplication(), device)
+            _uiState.update {
+                it.copy(
+                    isInspectingMbr = false,
+                    mbrReport = report
+                )
+            }
+        }
+    }
+
+    fun restoreUsbBootSector(device: UsbDevice, backupLba: Long, targetLba: Long) {
+        _uiState.update { it.copy(isInspectingMbr = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = UsbOtgManager.restoreBackupBootSector(
+                context = getApplication(),
+                device = device,
+                backupLba = backupLba,
+                targetLba = targetLba
+            )
+            _uiState.update {
+                it.copy(
+                    isInspectingMbr = false,
+                    mbrReport = report,
+                    snackbarMessage = report.statusMessage
+                )
+            }
+        }
+    }
+
+    fun dismissMbrReport() {
+        _uiState.update { it.copy(mbrReport = null) }
+    }
+
+    fun dumpRawUsbDiskImage(device: UsbDevice) {
+        usbJob?.cancel()
+        _uiState.update {
+            it.copy(
+                isUsbCarving = true,
+                usbCarveProgressPercent = 0.02f,
+                usbCarveStatus = if (it.appLanguage == "ar")
+                    "جاري إنشاء نسخة خام للقطاعات (.img) داخل ذاكرة الهاتف..."
+                else
+                    "Creating raw sector-by-sector disk image (.img)..."
+            )
+        }
+
+        usbJob = viewModelScope.launch(Dispatchers.IO) {
+            val imgFile = UsbOtgManager.dumpRawUsbImage(
+                context = getApplication(),
+                device = device,
+                maxMegaBytes = 512,
+                onProgress = { copied, total, msg ->
+                    val pct = if (total > 0L) (copied.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
+                    _uiState.update {
+                        it.copy(
+                            usbCarveProgressPercent = pct,
+                            usbCarveStatus = msg
+                        )
+                    }
+                }
+            )
+
+            _uiState.update { state ->
+                state.copy(
+                    isUsbCarving = false,
+                    usbCarveProgressPercent = 1.0f,
+                    snackbarMessage = if (imgFile != null) {
+                        if (state.appLanguage == "ar")
+                            "تم حفظ صورة القرص الخام بنجاح: ${imgFile.name}"
+                        else
+                            "Raw disk image saved: ${imgFile.name}"
+                    } else {
+                        if (state.appLanguage == "ar") "تعذر إنشاء صورة القرص الخام" else "Could not dump raw disk image"
+                    }
                 )
             }
         }
@@ -263,7 +364,7 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update {
             it.copy(
                 isUsbCarving = true,
-                usbCarveStatus = if (it.appLanguage == "ar") "فحص الدليل بصلاحيات سيزوكي المتقدمة..." else "Scanning elevated directory via Shizuku..."
+                usbCarveStatus = if (it.appLanguage == "ar") "فحص الدليل/الكتلة بصلاحيات سيزوكي المتقدمة..." else "Scanning elevated node via Shizuku..."
             )
         }
 
@@ -272,7 +373,12 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                 context = getApplication(),
                 targetPath = targetPath,
                 onProgress = { count, status ->
-                    _uiState.update { it.copy(usbCarveStatus = status) }
+                    _uiState.update {
+                        it.copy(
+                            usbRescuedCount = count,
+                            usbCarveStatus = status
+                        )
+                    }
                 }
             )
 
@@ -356,6 +462,7 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                 )
             )
         }
+        refreshUsbAndShizuku()
     }
 
     fun toggleFileSelection(fileId: String) {
@@ -408,9 +515,9 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                     salvagedFiles = updatedSalvaged,
                     inspectingFile = if (state.inspectingFile?.id == file.id) rescued else state.inspectingFile,
                     snackbarMessage = if (state.appLanguage == "ar")
-                        "تم حفظ الملف بنجاح في مجلد OpenFileRescue"
+                        "تم حفظ الملف في OpenFileRescue/${file.category.folderName}"
                     else
-                        "File successfully saved to OpenFileRescue directory"
+                        "Saved file to OpenFileRescue/${file.category.folderName}"
                 )
             }
         }
@@ -450,10 +557,52 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                     isBatchRescuing = false,
                     currentTab = AppTab.SALVAGED,
                     snackbarMessage = if (state.appLanguage == "ar")
-                        "تمت استعادة ${rescuedList.size} ملفات بنجاح وإنشاء تقرير الاستعادة!"
+                        "تمت استعادة ${rescuedList.size} ملفات وتصنيفها بنجاح!"
                     else
-                        "Successfully rescued ${rescuedList.size} files and generated manifest!"
+                        "Successfully rescued and categorized ${rescuedList.size} files!"
                 )
+            }
+        }
+    }
+
+    fun exportAllSalvagedToDownloads() {
+        val files = _uiState.value.salvagedFiles
+        if (files.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val count = FileRescueManager.exportAllToPublicDownloads(getApplication(), files)
+            _uiState.update { state ->
+                state.copy(
+                    snackbarMessage = if (state.appLanguage == "ar")
+                        "تم نسخ وفهرسة $count ملف في مجلد التنزيلات العام (Downloads/OpenFileRescue)!"
+                    else
+                        "Exported & indexed $count files into Downloads/OpenFileRescue!"
+                )
+            }
+        }
+    }
+
+    fun exportAndShareAllSalvagedAsZip() {
+        val files = _uiState.value.salvagedFiles
+        if (files.isEmpty()) return
+        _uiState.update { it.copy(isExportingZip = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = getApplication<Application>()
+            val zipFile = FileRescueManager.createZipArchive(context, files)
+            _uiState.update { state ->
+                state.copy(
+                    isExportingZip = false,
+                    snackbarMessage = if (zipFile != null) {
+                        if (state.appLanguage == "ar")
+                            "تم إنشاء أرشيف ZIP: ${zipFile.name} (${FileRescueManager.formatFileSize(zipFile.length())})"
+                        else
+                            "Created ZIP archive: ${zipFile.name} (${FileRescueManager.formatFileSize(zipFile.length())})"
+                    } else {
+                        if (state.appLanguage == "ar") "تعذر إنشاء ملف ZIP" else "Failed to create ZIP archive"
+                    }
+                )
+            }
+            if (zipFile != null) {
+                FileRescueManager.shareFileViaChooser(context, zipFile, "application/zip")
             }
         }
     }
@@ -461,7 +610,7 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
     fun executeRepair(target: RescuedFile) {
         _uiState.update { it.copy(isRepairing = true, repairReport = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            val rescueDir = FileRescueManager.getRescueDirectory(getApplication())
+            val rescueDir = FileRescueManager.getCategorySubdirectory(getApplication(), target.category)
             val report = FileRepairEngine.repairFile(getApplication(), target, rescueDir)
 
             _uiState.update { state ->
@@ -552,13 +701,12 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
 
     fun loadExistingSalvagedFiles() {
         viewModelScope.launch(Dispatchers.IO) {
-            val dir = FileRescueManager.getRescueDirectory(getApplication())
-            val files = dir.listFiles()?.filter { it.isFile && !it.name.startsWith("recovery_manifest_") } ?: emptyList()
+            val files = FileRescueManager.listAllSalvagedFilesOnDisk(getApplication())
 
             val rescued = files.map { file ->
                 val carve = FileCarver.inspectFile(file)
                 RescuedFile(
-                    id = file.name,
+                    id = file.absolutePath,
                     name = file.name,
                     path = file.absolutePath,
                     uri = null,

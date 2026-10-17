@@ -2,13 +2,14 @@ package com.example.model
 
 import android.net.Uri
 
-enum class FileCategory(val label: String, val labelAr: String) {
-    PHOTO("Photos", "الصور"),
-    VIDEO("Videos", "الفيديوهات"),
-    AUDIO("Audio", "الصوتيات"),
-    DOCUMENT("Documents", "المستندات"),
-    ARCHIVE("Archives", "الأرشيف"),
-    OTHER("Other", "أخرى")
+enum class FileCategory(val label: String, val labelAr: String, val folderName: String) {
+    PHOTO("Photos", "الصور", "Images"),
+    VIDEO("Videos", "الفيديوهات", "Videos"),
+    AUDIO("Audio", "الصوتيات", "Audio"),
+    DOCUMENT("Documents", "المستندات", "Documents"),
+    DATABASE("Databases", "قواعد البيانات", "Databases"),
+    ARCHIVE("Archives", "الأرشيف", "Archives"),
+    OTHER("Other", "أخرى", "Other")
 }
 
 enum class FileHealthState(val label: String, val labelAr: String) {
@@ -82,4 +83,18 @@ data class RepairReport(
     val message: String,
     val repairedPath: String? = null,
     val fixesApplied: List<String> = emptyList()
+)
+
+data class MbrBootSectorReport(
+    val deviceName: String = "",
+    val lba0HexDump: String = "",
+    val has55AaSignature: Boolean = false,
+    val detectedFileSystemType: String = "Unknown",
+    val backupBootSectorFound: Boolean = false,
+    val backupSectorLba: Long = -1L,
+    val targetRestoreLba: Long = 0L,
+    val backupHexDump: String = "",
+    val canRestoreInPlace: Boolean = false,
+    val statusMessage: String = "",
+    val isRestored: Boolean = false
 )
