@@ -112,7 +112,11 @@ class RescueViewModel(application: Application) : AndroidViewModel(application) 
                 addAction(UsbOtgManager.ACTION_USB_PERMISSION)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                application.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                try {
+                    application.registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED)
+                } catch (_: Exception) {
+                    application.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                }
             } else {
                 application.registerReceiver(usbReceiver, filter)
             }

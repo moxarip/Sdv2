@@ -90,18 +90,25 @@ object UsbOtgManager {
 
     fun requestPermission(context: Context, device: UsbDevice) {
         val manager = getUsbManager(context)
+        val permissionIntent = Intent(ACTION_USB_PERMISSION).apply {
+            setPackage(context.packageName) // Mandatory on Android 14 to prevent FLAG_MUTABLE crash
+        }
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-        val permissionIntent = PendingIntent.getBroadcast(
+        val pendingIntent = PendingIntent.getBroadcast(
             context,
             0,
-            Intent(ACTION_USB_PERMISSION),
+            permissionIntent,
             flags
         )
-        manager.requestPermission(device, permissionIntent)
+        try {
+            manager.requestPermission(device, pendingIntent)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     /**
