@@ -16,12 +16,7 @@
 .externalNativeBuild
 .cxx
 local.properties
-.env
-*.apk
-*.aab
-*.ap_
-*.dex
-*.class
+!debug/*.apk
 bin/
 gen/
 out/
